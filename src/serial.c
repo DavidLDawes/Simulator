@@ -99,6 +99,9 @@ static bool serialPutC (const uint8_t c)
     atomic_thread_fence(memory_order_release);                  // making sure it is visible before the head pointer (UART ISR reads it on the simulator thread)
     txbuffer.head = next_head;                                  // and update head pointer
 
+    // Full fence between publishing head and enabling TX; pairs with the one in
+    // uart_interrupt_handler() so a byte can't be stranded with TX disabled.
+    atomic_thread_fence(memory_order_seq_cst);
     uart.tx_irq_enable = 1;                                     // Enable TX interrupts
 
     return true;
@@ -178,8 +181,18 @@ static void uart_interrupt_handler (void)
 
             txbuffer.tail = bptr;                             //  Update tail pinter
 
-            if(bptr == txbuffer.head)                         // Disable TX interrups
+            if(bptr == txbuffer.head) {                       // Disable TX interrups
                 uart.tx_irq_enable = 0;                       // when TX buffer empty
+                // ...but serialPutC() runs on the grbl thread and may have published
+                // a byte and set tx_irq_enable = 1 between the check above and the
+                // clear, which would leave that byte stranded until the next write.
+                // Recheck behind a full fence (paired with serialPutC's): if a byte
+                // arrived, keep transmitting. With both fences at least one side
+                // sees the other's write, so pending output can't be left disabled.
+                atomic_thread_fence(memory_order_seq_cst);
+                if(bptr != txbuffer.head)
+                    uart.tx_irq_enable = 1;
+            }
         }
     }
 
